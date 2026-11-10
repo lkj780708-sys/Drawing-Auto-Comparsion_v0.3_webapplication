@@ -1,0 +1,562 @@
+--- v0.4/backend/app/main.py
++++ v0.4.1/backend/app/main.py
+@@ -65,7 +65,7 @@
+             f.unlink(missing_ok=True)
+         yield
+ 
+-    app = FastAPI(title="Drawing Auto Comparison API", version="0.4.0 (engine v10)", lifespan=lifespan)
++    app = FastAPI(title="Drawing Auto Comparison API", version="0.4.1 (engine v10)", lifespan=lifespan)
+     app.add_middleware(CORSMiddleware, allow_origins=list(cfg.allowed_origins), allow_methods=["*"],
+                        allow_headers=["*"], expose_headers=["Content-Disposition"])
+     app.state.cfg, app.state.db, app.state.storage, app.state.runner = cfg, db, storage, runner
+@@ -183,6 +183,7 @@
+             error=r["error"])
+ 
+     CHANGE_SQL = ("SELECT c.*, v.status, v.comment, v.reviewer, v.reviewed_at, "
++                  "v.dismissed_at, v.dismissed_by, v.dismissed_prev_status, "
+                   "a.result ai_result, a.summary ai_summary, a.model ai_model, a.created_at ai_at FROM changes c "
+                   "JOIN reviews v ON v.change_id=c.id LEFT JOIN ai_results a ON a.change_id=c.id ")
+ 
+@@ -205,7 +206,8 @@
+                 dpi=dpi, removed_px=r["removed"], added_px=r["added"],
+                 detection_method=result["detection_method"], alignment_status=page["alignment"]["status"]),
+             review=S.ReviewOut(status=r["status"], comment=r["comment"], reviewer=r["reviewer"],
+-                               reviewed_at=_dt(r["reviewed_at"])),
++                               reviewed_at=_dt(r["reviewed_at"]), dismissed=bool(r["dismissed_at"]),
++                               dismissed_at=_dt(r["dismissed_at"]), dismissed_by=r["dismissed_by"]),
+             ai=ai, created_at=_dt(r["created_at"]))
+ 
+     # ------------------------------------------------------------------ meta / settings
+@@ -397,13 +399,72 @@
+         comment = body.comment if body.comment is not None else r["comment"]
+         reviewer = body.reviewer if body.reviewer is not None else r["reviewer"]
+         ts = now_iso()
++        undismiss = bool(r["dismissed_at"]) and st != "No Change"
+         with db.tx() as c:
+             c.execute("UPDATE reviews SET status=?, comment=?, reviewer=?, reviewed_at=? WHERE change_id=?",
+                       (st, comment, reviewer, ts, change_id))
+-            c.execute("INSERT INTO review_history(change_id, status, comment, reviewer, changed_at) "
+-                      "VALUES (?,?,?,?,?)", (change_id, st, comment, reviewer, ts))
++            if undismiss:            # 삭제된 영역을 다른 판정으로 바꾸면 화면에 다시 표시
++                c.execute("UPDATE reviews SET dismissed_at=NULL, dismissed_by=NULL, dismissed_prev_status=NULL "
++                          "WHERE change_id=?", (change_id,))
++            c.execute("INSERT INTO review_history(change_id, status, comment, reviewer, changed_at, action) "
++                      "VALUES (?,?,?,?,?,?)", (change_id, st, comment, reviewer, ts,
++                                               "restore_by_review" if undismiss else "review"))
+         return _change_out(db.one(CHANGE_SQL + "WHERE c.id=?", (change_id,)), cmp_row, result)
+ 
++    # ------------------------------------------------------------------ 오른쪽 클릭 삭제 (변경 없음) / 복원
++    # 자동 탐지 결과(changes 표)는 지우지 않는다. 사용자 판정을 'No Change' 로 바꾸고 삭제 표시만 남긴다.
++    def _editable_change(change_id: str) -> tuple[Any, Any, dict[str, Any]]:
++        r = db.one(CHANGE_SQL + "WHERE c.id=?", (_id(change_id, "변경 영역"),))
++        if r is None:
++            raise HTTPException(404, "변경 영역을 찾을 수 없습니다")
++        cmp_row, result = _done_cmp(r["comparison_id"])
++        if cmp_row["review_completed_at"]:
++            raise HTTPException(409, "검토 완료된 비교입니다. 먼저 검토 완료를 해제하세요")
++        return r, cmp_row, result
++
++    @app.post("/api/changes/{change_id}/dismiss", response_model=S.ChangeOut)
++    def dismiss_change(change_id: str, body: S.DismissIn) -> S.ChangeOut:
++        r, cmp_row, result = _editable_change(change_id)
++        if r["dismissed_at"]:
++            raise HTTPException(409, "이미 삭제된 영역입니다")
++        ts = now_iso()
++        who = body.reviewer if body.reviewer is not None else r["reviewer"]
++        with db.tx() as c:
++            c.execute("UPDATE reviews SET status='No Change', reviewer=?, reviewed_at=?, dismissed_at=?, dismissed_by=?, "
++                      "dismissed_prev_status=? WHERE change_id=?", (who, ts, ts, who, r["status"], change_id))
++            c.execute("INSERT INTO review_history(change_id, status, comment, reviewer, changed_at, action) "
++                      "VALUES (?,?,?,?,?,?)", (change_id, "No Change", r["comment"], who, ts, "user_delete"))
++        log.info("change %s dismissed (user delete -> No Change)", change_id)
++        return _change_out(db.one(CHANGE_SQL + "WHERE c.id=?", (change_id,)), cmp_row, result)
++
++    @app.post("/api/changes/{change_id}/restore", response_model=S.ChangeOut)
++    def restore_change(change_id: str, body: S.DismissIn) -> S.ChangeOut:
++        r, cmp_row, result = _editable_change(change_id)
++        if not r["dismissed_at"]:
++            raise HTTPException(409, "삭제된 영역이 아닙니다")
++        ts = now_iso()
++        who = body.reviewer if body.reviewer is not None else r["reviewer"]
++        prev = r["dismissed_prev_status"] or "Unreviewed"            # 삭제 직전 판정으로 되돌림
++        with db.tx() as c:
++            c.execute("UPDATE reviews SET status=?, reviewer=?, reviewed_at=?, dismissed_at=NULL, dismissed_by=NULL, "
++                      "dismissed_prev_status=NULL WHERE change_id=?", (prev, who, ts, change_id))
++            c.execute("INSERT INTO review_history(change_id, status, comment, reviewer, changed_at, action) "
++                      "VALUES (?,?,?,?,?,?)", (change_id, prev, r["comment"], who, ts, "restore"))
++        log.info("change %s restored -> %s", change_id, prev)
++        return _change_out(db.one(CHANGE_SQL + "WHERE c.id=?", (change_id,)), cmp_row, result)
++
++    HISTORY_LABEL = {"review": "판정 변경", "user_delete": "사용자 삭제 (변경 없음)", "restore": "삭제 복원",
++                     "restore_by_review": "판정 변경 (삭제 해제)"}
++
++    @app.get("/api/changes/{change_id}/history", response_model=list[S.HistoryOut])
++    def change_history(change_id: str) -> list[S.HistoryOut]:
++        r = db.one("SELECT id FROM changes WHERE id=?", (_id(change_id, "변경 영역"),))
++        if r is None:
++            raise HTTPException(404, "변경 영역을 찾을 수 없습니다")
++        return [S.HistoryOut(action=h["action"], status=h["status"], comment=h["comment"], reviewer=h["reviewer"],
++                             changed_at=_dt(h["changed_at"]), label=HISTORY_LABEL.get(h["action"], h["action"]))
++                for h in db.all("SELECT * FROM review_history WHERE change_id=? ORDER BY id", (change_id,))]
++
+     # ------------------------------------------------------------------ images (저장된 결과로만 그림, 재비교 없음)
+     def _png(arr: np.ndarray, scale: float) -> bytes:
+         im = Image.fromarray(arr)
+@@ -557,11 +618,13 @@
+                            download_url=f"/api/exports/{r['id']}/download")
+ 
+     def _result_json(row: Any) -> dict[str, Any]:
+-        hist = [dict(h) for h in db.all(
++        hist = [{**dict(h), "label": HISTORY_LABEL.get(h["action"], h["action"])} for h in db.all(
+             "SELECT h.* FROM review_history h JOIN changes c ON c.id=h.change_id WHERE c.comparison_id=? "
+             "ORDER BY h.id", (row["id"],))]
+         runs = [dict(r) for r in db.all("SELECT * FROM ai_runs WHERE comparison_id=? ORDER BY created_at", (row["id"],))]
+-        return {"format": "drawing-auto-comparison/result", "format_version": 2, "exported_at": now_iso(),
++        return {"format": "drawing-auto-comparison/result", "format_version": 3, "exported_at": now_iso(),
++                "dismissed_count": db.one("SELECT COUNT(*) n FROM reviews v JOIN changes c ON c.id=v.change_id "
++                                          "WHERE c.comparison_id=? AND v.dismissed_at IS NOT NULL", (row["id"],))["n"],
+                 "comparison": _cmp_out(row).model_dump(mode="json"),
+                 "changes": [c.model_dump(mode="json") for c in list_changes(row["id"])],
+                 "review_history": hist, "ai_runs": runs,
+--- v0.4/backend/app/schemas.py
++++ v0.4.1/backend/app/schemas.py
+@@ -234,6 +234,9 @@
+     comment: Optional[str]
+     reviewer: Optional[str]
+     reviewed_at: Optional[datetime]
++    dismissed: bool = Field(description="사용자가 화면에서 삭제함 (판정 = No Change). 자동 탐지 결과는 그대로 보존")
++    dismissed_at: Optional[datetime]
++    dismissed_by: Optional[str]
+ 
+ 
+ class AiOut(BaseModel):
+@@ -266,6 +269,20 @@
+     reviewer: Optional[str] = Field(default=None, max_length=100)
+ 
+ 
++class DismissIn(_Strict):
++    """오른쪽 클릭 → 삭제 (변경 없음) / 복원."""
++    reviewer: Optional[str] = Field(default=None, max_length=100)
++
++
++class HistoryOut(BaseModel):
++    action: str
++    status: ReviewStatus
++    comment: Optional[str]
++    reviewer: Optional[str]
++    changed_at: datetime
++    label: str
++
++
+ class BubbleOut(BaseModel):
+     region_no: int
+     cx: float
+--- v0.4/backend/app/db.py
++++ v0.4.1/backend/app/db.py
+@@ -55,6 +55,22 @@
+ """
+ 
+ 
++# v0.4.1: 사용자 삭제(변경 없음) 표시. 기존 DB 에는 컬럼만 추가하고 기존 기록은 그대로 둔다.
++MIGRATIONS = (
++    ("reviews", "dismissed_at", "TEXT"),
++    ("reviews", "dismissed_by", "TEXT"),
++    ("reviews", "dismissed_prev_status", "TEXT"),
++    ("review_history", "action", "TEXT NOT NULL DEFAULT 'review'"),
++)
++
++
++def _migrate(c: sqlite3.Connection) -> None:
++    for table, col, decl in MIGRATIONS:
++        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
++        if col not in cols:
++            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
++
++
+ def now_iso() -> str:
+     return datetime.now(timezone.utc).isoformat()
+ 
+@@ -66,6 +82,7 @@
+         path.parent.mkdir(parents=True, exist_ok=True)
+         with self.tx() as c:
+             c.executescript(SCHEMA)
++            _migrate(c)
+ 
+     @contextmanager
+     def tx(self) -> Iterator[sqlite3.Connection]:
+--- v0.4/frontend/components/App.tsx
++++ v0.4.1/frontend/components/App.tsx
+@@ -104,6 +104,8 @@
+   // AI 키 입력 창
+   const [keyDlg, setKeyDlg] = useState(false);
+   const [keyVal, setKeyVal] = useState("");
++  // 오른쪽 클릭 메뉴 (변경 영역 삭제/복원)
++  const [ctx, setCtx] = useState<{ x: number; y: number; change: Change } | null>(null);
+ 
+   const setStatus = useCallback((t: string, error = false) => {
+     setStatusText(t);
+@@ -183,6 +185,8 @@
+   const pg = cmp?.pages[page] ?? null;
+   const k = (cmp?.settings.dpi ?? 200) / 72;
+   const pageChanges = useMemo(() => changes.filter((c) => c.baseline_page === page), [changes, page]);
++  /** 화면 표시용 (오른쪽 클릭으로 삭제한 영역 제외). 자동 탐지 결과는 서버에 그대로 남아 있다 */
++  const visibleChanges = useMemo(() => pageChanges.filter((c) => !c.review.dismissed), [pageChanges]);
+   const selected = changes.find((c) => c.change_id === selectedId) ?? null;
+   const alignFailedHidden = pg?.alignment.status === "Alignment Failed" && !showFailed[page];
+   const locked = Boolean(cmp?.review_completed_at);
+@@ -353,6 +357,11 @@
+ 
+   // 변경 알림(숫자): 기존 place_bubbles 를 서버에서 실행 (배율에 따라 위치가 달라짐)
+   const bubblesOn = Boolean(cmp && pg && showBubbles && !side && mode !== "old" && !alignFailedHidden && pg.change_count > 0 && pg.change_count <= BUBBLE_MAX_DISPLAY);
++  const shownBubbles = useMemo(() => {
++    if (!bubbles) return null;
++    const keep = new Set(visibleChanges.map((c) => c.detection.region_no));
++    return bubbles.filter((b) => keep.has(b.region_no));
++  }, [bubbles, visibleChanges]);
+   const zoomKey = view ? Math.round(view.zoom * 1e5) / 1e5 : 0;
+   useEffect(() => {
+     if (!bubblesOn || !cmp || !zoomKey) {
+@@ -415,7 +424,7 @@
+     setCard(null);
+   }
+   function openCardForRegion(regionNo: number) {
+-    const c = pageChanges.find((x) => x.detection.region_no === regionNo);
++    const c = visibleChanges.find((x) => x.detection.region_no === regionNo);
+     if (!c || !cmp || !view) return;
+     setSelectedId(c.change_id);
+     setAiNote(c.ai ? `${c.ai.label}\n설명 : ${c.ai.summary}` : null);
+@@ -459,6 +468,43 @@
+     }
+   }, [showNotice]);
+ 
++  // ------------------------------------------------------------------ 오른쪽 클릭 삭제 (변경 없음) / 복원
++  const openRegionMenu = useCallback((regionNo: number, x: number, y: number) => {
++    const c = pageChanges.find((q) => q.detection.region_no === regionNo);
++    if (c) {
++      setSelectedId(c.change_id);
++      setCtx({ x, y, change: c });
++    }
++  }, [pageChanges]);
++  async function dismissOrRestore(c: Change) {
++    setCtx(null);
++    if (locked) {
++      showNotice("검토 완료된 비교입니다. 먼저 검토 완료를 해제하세요");
++      return;
++    }
++    try {
++      const r = c.review.dismissed ? await api.restoreChange(c.change_id, reviewer || null) : await api.dismissChange(c.change_id, reviewer || null);
++      await onSaved(r);
++      if (!c.review.dismissed && card?.regionNo === c.detection.region_no) setCard(null);
++      showNotice(c.review.dismissed ? `변경 #${c.detection.region_no} 복원 (이력: 삭제 복원)` : `변경 #${c.detection.region_no} 삭제 – 판정: 변경 없음 (이력: 사용자 삭제). 검토 패널 '삭제됨'에서 복원할 수 있습니다`);
++    } catch (e) {
++      showNotice(errText(e), 12000);
++    }
++  }
++  useEffect(() => {
++    if (!ctx) return;
++    const close = () => setCtx(null);
++    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setCtx(null);
++    window.addEventListener("pointerdown", close);
++    window.addEventListener("keydown", onKey);
++    window.addEventListener("resize", close);
++    return () => {
++      window.removeEventListener("pointerdown", close);
++      window.removeEventListener("keydown", onKey);
++      window.removeEventListener("resize", close);
++    };
++  }, [ctx]);
++
+   // ------------------------------------------------------------------ 키보드
+   useEffect(() => {
+     const onKey = (e: KeyboardEvent) => {
+@@ -473,7 +519,7 @@
+       }
+       if (isTyping(e.target)) return;
+       if (e.key === "Escape" && menuOpen && !menuPinned) setMenuOpen(false);
+-      const vis = alignFailedHidden ? [] : pageChanges;
++      const vis = alignFailedHidden ? [] : visibleChanges;
+       if ((e.key === "n" || e.key === "p") && vis.length) {
+         const i = vis.findIndex((c) => c.change_id === selectedId);
+         const d = e.key === "n" ? 1 : -1;
+@@ -485,7 +531,7 @@
+     };
+     window.addEventListener("keydown", onKey);
+     return () => window.removeEventListener("keydown", onKey);
+-  }, [menuOpen, menuPinned, persist, pageChanges, selectedId, selected, locked, reviewer, goTo, onSaved, showNotice, alignFailedHidden]);
++  }, [menuOpen, menuPinned, persist, visibleChanges, selectedId, selected, locked, reviewer, goTo, onSaved, showNotice, alignFailedHidden]);
+ 
+   // ------------------------------------------------------------------ 저장 (기존 SAVE RESULT AS PDF)
+   async function saveResult() {
+@@ -597,6 +643,7 @@
+         `정렬: ${pg.alignment.engine_reason}`, `허용 오차: ${cmp?.settings.tol_mm} mm`,
+         ...(!pg.old_exists ? ["Old 문서에 없는 페이지(빈 페이지로 비교)"] : []), ...(!pg.new_exists ? ["New 문서에 없는 페이지(빈 페이지로 비교)"] : []),
+         pg.change_count > BUBBLE_MAX_DISPLAY ? `변경 영역 ${pg.change_count}개 (너무 많아 숫자 버블 미표시)` : `변경 영역 ${pg.change_count}개`,
++          ...(pageChanges.length - visibleChanges.length ? [`사용자 삭제 ${pageChanges.length - visibleChanges.length}개 (변경 없음)`] : []),
+       ].join("   |   ")
+     : "";
+   const saveTarget = !cmp ? "현재 화면 기준 저장 대상: (비교 후 표시)" : side || mode === "old" ? "현재 화면 기준 저장 대상: 없음 (Old 화면은 저장하지 않음)" : mode === "new" ? "현재 화면 기준 저장 대상: New 문서 (+ 마크업)" : "현재 화면 기준 저장 대상: Overlay 결과 (+ New 마크업)";
+@@ -631,7 +678,7 @@
+   const failedBanner = alignFailedHidden ? `정렬 실패 – 이 페이지의 차이 ${pg?.change_count}개는 실제 도면 변경으로 볼 수 없습니다 (변경 알림 숨김). 오른쪽 검토 패널에서 '그래도 보기'를 누를 수 있습니다.` : "";
+   const commonViewer = {
+     imgW, imgH, dpi: cmp?.settings.dpi ?? 200, view, onView, fitSignal, selectedNo: selected && selected.baseline_page === page ? selected.detection.region_no : null,
+-    onBubble: openCardForRegion, tool, setTool, toolStyle, sel, setSel, onMarkups, boxZoom, magnifier, onMagClick, onNotice: showNotice, onCursor: setCursor,
++    onBubble: openCardForRegion, onRegionMenu: openRegionMenu, tool, setTool, toolStyle, sel, setSel, onMarkups, boxZoom, magnifier, onMagClick, onNotice: showNotice, onCursor: setCursor,
+   };
+   const img = (layer: "old" | "old_aligned" | "new" | "overlay") => (cmp ? pageImageUrl(cmp.id, page, layer, scale, layer === "overlay" ? colors : undefined) : null);
+   const cardRect = card && cmp && card.page === page && !(mode === "old" && !side) ? cardRegionPx(card, cmp.settings.dpi, cardPane[0], cardPane[1]) : null;
+@@ -814,13 +861,13 @@
+                 <div className="w-1" />
+                 <Viewer {...commonViewer} role="side_new" label={<div className="sec px-1.5 py-0.5 text-white" style={{ background: "var(--blue)" }}>NEW · 마크업 편집 가능</div>}
+                   src={pg?.new_exists ? img("new") : null} emptyText="NEW 문서에 없는 페이지 (빈 페이지로 비교됨)" onSize={onHost}
+-                  changes={pageChanges} showBoxes={false} bubbles={null} markups={pageMarkups} editable={editOk} denyReason={editWhy} cardRect={cardRect} />
++                  changes={visibleChanges} showBoxes={false} bubbles={null} markups={pageMarkups} editable={editOk} denyReason={editWhy} cardRect={cardRect} />
+               </>
+             ) : (
+               <Viewer {...commonViewer} role="main" onSize={onHost}
+                 src={mode === "old" ? (pg?.old_exists ? img("old") : null) : mode === "new" ? (pg?.new_exists ? img("new") : null) : img("overlay")}
+                 emptyText={mode === "old" ? "OLD 문서에 없는 페이지 (빈 페이지로 비교됨)" : "NEW 문서에 없는 페이지 (빈 페이지로 비교됨)"}
+-                changes={alignFailedHidden ? [] : pageChanges} showBoxes={showDiffBox && mode !== "old" && !alignFailedHidden} bubbles={bubblesOn ? bubbles : null}
++                changes={alignFailedHidden ? [] : visibleChanges} showBoxes={showDiffBox && mode !== "old" && !alignFailedHidden} bubbles={bubblesOn ? shownBubbles : null}
+                 markups={mode === "old" ? null : pageMarkups} editable={editOk} denyReason={editWhy} cardRect={cardRect} />
+             )}
+             {card && cmp && pg && card.page === page && (
+@@ -837,7 +884,8 @@
+               onProject={(id) => { const p = projects.find((x) => x.id === id); if (p) void loadProjectData(p).catch((e: unknown) => showNotice(errText(e))); }}
+               onNewProject={(name) => void api.createProject(name).then(async (p) => { setProjects(await api.listProjects()); await loadProjectData(p); }, (e: unknown) => showNotice(errText(e)))}
+               history={history} onOpen={(id) => void openComparison(id).catch((e: unknown) => showNotice(errText(e)))} onExportJson={() => void exportJson()}
+-              alignFailedHidden={alignFailedHidden} onShowFailed={() => setShowFailed((s) => ({ ...s, [page]: true }))} onClose={() => setReviewOpen(false)} />
++              alignFailedHidden={alignFailedHidden} onShowFailed={() => setShowFailed((s) => ({ ...s, [page]: true }))} onClose={() => setReviewOpen(false)}
++              onRowMenu={(c, x, y) => { setSelectedId(c.change_id); setCtx({ x, y, change: c }); }} />
+           )}
+         </div>
+         {/* 6) 하단 통계 줄 */}
+@@ -847,6 +895,18 @@
+         </div>
+       </div>
+ 
++      {ctx && (
++        <div className="fixed z-50 min-w-[190px] py-1 text-xs shadow-lg" role="menu"
++          style={{ left: Math.min(ctx.x, window.innerWidth - 200), top: Math.min(ctx.y, window.innerHeight - 90), background: "var(--panel)", border: "1px solid var(--border)" }}
++          onPointerDown={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
++          <div className="px-3 py-1 sec">변경 #{ctx.change.detection.region_no}{ctx.change.review.dismissed ? " · 삭제됨" : ""}</div>
++          <button type="button" role="menuitem" autoFocus className="block w-full px-3 py-1.5 text-left hover:opacity-80" disabled={locked}
++            style={{ color: ctx.change.review.dismissed ? "var(--fg)" : "var(--red)", opacity: locked ? 0.45 : 1 }} onClick={() => void dismissOrRestore(ctx.change)}>
++            {ctx.change.review.dismissed ? "↩ 복원" : "🗑 삭제 (변경 없음)"}
++          </button>
++          {locked && <div className="px-3 pb-1" style={{ color: "var(--fg2)" }}>검토 완료 상태 – 해제 후 가능</div>}
++        </div>
++      )}
+       {keyDlg && (
+         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: "rgba(0,0,0,.4)" }}>
+           <div className="w-[420px] space-y-2 p-4" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
+--- v0.4/frontend/components/Viewer.tsx
++++ v0.4.1/frontend/components/Viewer.tsx
+@@ -43,6 +43,8 @@
+   onNotice: (msg: string) => void;
+   onCursor?: (p: Pt | null) => void;
+   onActivate?: () => void;
++  /** 버블·변경 박스 오른쪽 클릭 (clientX, clientY = 메뉴 위치) */
++  onRegionMenu?: (regionNo: number, clientX: number, clientY: number) => void;
+ }
+ 
+ type Drag =
+@@ -179,6 +181,32 @@
+     return null;
+   }
+ 
++  /** 화면 좌표의 변경 박스 (보이는 박스만, 가장 작은 것 우선) */
++  function hitBox(sx: number, sy: number): number | null {
++    if (!v || !(p.showBoxes || p.selectedNo !== null)) return null;
++    const pad = DIFF_BOX_PAD_PX + 2;
++    let best: number | null = null;
++    let area = Infinity;
++    for (const c of p.changes) {
++      if (!p.showBoxes && c.detection.region_no !== p.selectedNo) continue;
++      const bb = c.detection.bounding_box_px;
++      const [x0, y0] = i2s(bb.x0, bb.y0), [x1, y1] = i2s(bb.x1, bb.y1);
++      if (sx >= x0 - pad && sx <= x1 + pad && sy >= y0 - pad && sy <= y1 + pad && (x1 - x0) * (y1 - y0) < area) {
++        best = c.detection.region_no;
++        area = (x1 - x0) * (y1 - y0);
++      }
++    }
++    return best;
++  }
++
++  function onContextMenu(e: RMouseEvent<HTMLDivElement>) {
++    e.preventDefault();
++    if (!p.onRegionMenu || !v || p.tool || poly.length || tip) return;
++    const [sx, sy] = local(e);
++    const reg = hitBubble(sx, sy) ?? hitBox(sx, sy);
++    if (reg !== null) p.onRegionMenu(reg, e.clientX, e.clientY);
++  }
++
+   function onPointerDown(e: RPointerEvent<HTMLDivElement>) {
+     if (!v || !p.src || e.button !== 0) return;
+     boxRef.current?.focus();
+@@ -424,7 +452,7 @@
+         onPointerLeave={() => p.onCursor?.(null)}
+         onDoubleClick={onDoubleClick}
+         onKeyDown={onKeyDown}
+-        onContextMenu={(e) => e.preventDefault()}
++        onContextMenu={onContextMenu}
+       >
+         {!p.src ? (
+           <div className="flex h-full items-center justify-center" style={{ color: "var(--fg2)" }}>{p.emptyText ?? ""}</div>
+--- v0.4/frontend/components/ReviewPanel.tsx
++++ v0.4.1/frontend/components/ReviewPanel.tsx
+@@ -5,7 +5,7 @@
+ import { useEffect, useState } from "react";
+ import { api, errText } from "@/lib/api";
+ import { pxToMm } from "@/lib/geometry";
+-import type { Change, Comparison, Project, ReviewStatus } from "@/lib/types";
++import type { Change, Comparison, HistoryItem, Project, ReviewStatus } from "@/lib/types";
+ import { REVIEW_STATUSES } from "@/lib/types";
+ 
+ export const REVIEW_KO: Record<ReviewStatus, { ko: string; key: string; color: string }> = {
+@@ -42,9 +42,12 @@
+   alignFailedHidden: boolean;
+   onShowFailed: () => void;
+   onClose: () => void;
++  /** 목록 줄 오른쪽 클릭 → 삭제/복원 메뉴 */
++  onRowMenu: (c: Change, clientX: number, clientY: number) => void;
+ }) {
+   const [tab, setTab] = useState<"review" | "history" | "result">("review");
+-  const [filter, setFilter] = useState<ReviewStatus | "all">("all");
++  const [filter, setFilter] = useState<ReviewStatus | "all" | "active" | "dismissed">("active");
++  const [hist, setHist] = useState<HistoryItem[] | null>(null);
+   const [comment, setComment] = useState("");
+   const [busy, setBusy] = useState(false);
+   const [err, setErr] = useState<string | null>(null);
+@@ -52,9 +55,26 @@
+   const sel = p.changes.find((c) => c.change_id === p.selectedId) ?? null;
+   const locked = Boolean(p.cmp?.review_completed_at);
+   useEffect(() => setComment(sel?.review.comment ?? ""), [sel?.change_id, sel?.review.comment]);
++  useEffect(() => {
++    if (!sel) {
++      setHist(null);
++      return;
++    }
++    let live = true;
++    api.changeHistory(sel.change_id).then((h) => live && setHist(h), () => live && setHist(null));
++    return () => {
++      live = false;
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [sel?.change_id, sel?.review.reviewed_at, sel?.review.dismissed]);
+ 
+   const pageChanges = p.changes.filter((c) => c.baseline_page === p.page);
+-  const shown = filter === "all" ? pageChanges : pageChanges.filter((c) => c.review.status === filter);
++  const nDismissed = pageChanges.filter((c) => c.review.dismissed).length;
++  const shown =
++    filter === "all" ? pageChanges
++      : filter === "active" ? pageChanges.filter((c) => !c.review.dismissed)
++        : filter === "dismissed" ? pageChanges.filter((c) => c.review.dismissed)
++          : pageChanges.filter((c) => c.review.status === filter && !c.review.dismissed);
+ 
+   async function save(status?: ReviewStatus) {
+     if (!sel) return;
+@@ -107,10 +127,12 @@
+           ) : (
+             <>
+               <div className="flex items-center gap-1">
+-                <span className="sec">변경 영역 {pageChanges.length}</span>
+-                <select className="inp ml-auto" value={filter} onChange={(e) => setFilter(e.target.value as ReviewStatus | "all")}>
+-                  <option value="all">전체</option>
+-                  {REVIEW_STATUSES.map((s) => <option key={s} value={s}>{REVIEW_KO[s].ko} ({pageChanges.filter((c) => c.review.status === s).length})</option>)}
++                <span className="sec" title="오른쪽 클릭으로 삭제(변경 없음)한 영역은 '삭제됨'에서 볼 수 있습니다">변경 영역 {pageChanges.length - nDismissed}{nDismissed ? ` (삭제 ${nDismissed})` : ""}</span>
++                <select className="inp ml-auto" value={filter} onChange={(e) => setFilter(e.target.value as typeof filter)}>
++                  <option value="active">표시 중 ({pageChanges.length - nDismissed})</option>
++                  {REVIEW_STATUSES.map((s) => <option key={s} value={s}>{REVIEW_KO[s].ko} ({pageChanges.filter((c) => c.review.status === s && !c.review.dismissed).length})</option>)}
++                  <option value="dismissed">삭제됨 ({nDismissed})</option>
++                  <option value="all">전체 ({pageChanges.length})</option>
+                 </select>
+               </div>
+               <div className="min-h-[120px] flex-1 overflow-y-auto" style={{ border: "1px solid var(--border)" }}>
+@@ -120,11 +142,13 @@
+                   </thead>
+                   <tbody>
+                     {shown.map((c) => (
+-                      <tr key={c.change_id} className="cursor-pointer" style={{ background: c.change_id === p.selectedId ? "var(--loaded)" : undefined, borderTop: "1px solid var(--border)" }} onClick={() => p.onSelect(c)}>
++                      <tr key={c.change_id} className="cursor-pointer" title="오른쪽 클릭: 삭제 (변경 없음) / 복원"
++                        style={{ background: c.change_id === p.selectedId ? "var(--loaded)" : undefined, borderTop: "1px solid var(--border)", opacity: c.review.dismissed ? 0.55 : 1, textDecoration: c.review.dismissed ? "line-through" : undefined }}
++                        onClick={() => p.onSelect(c)} onContextMenu={(e) => { e.preventDefault(); p.onRowMenu(c, e.clientX, e.clientY); }}>
+                         <td className="px-1 font-bold">{c.detection.region_no}</td>
+                         <td className="px-1 text-right">{c.detection.removed_px.toLocaleString()}</td>
+                         <td className="px-1 text-right">{c.detection.added_px.toLocaleString()}</td>
+-                        <td className="px-1" style={{ color: REVIEW_KO[c.review.status].color }}>{REVIEW_KO[c.review.status].ko}</td>
++                        <td className="px-1" style={{ color: c.review.dismissed ? "var(--fg2)" : REVIEW_KO[c.review.status].color }}>{c.review.dismissed ? "삭제(변경 없음)" : REVIEW_KO[c.review.status].ko}</td>
+                         <td className="px-1" title={c.ai?.summary}>{c.ai?.label ?? ""}</td>
+                         <td className="text-center">{c.review.comment ? "●" : ""}</td>
+                       </tr>
+@@ -161,6 +185,21 @@
+                     </div>
+                     {locked && <p style={{ color: "var(--fg2)" }}>검토 완료 상태라 수정할 수 없습니다.</p>}
+                   </div>
++                    {sel.review.dismissed && (
++                      <div className="p-1.5" style={{ border: "1px solid var(--warn)", color: "var(--warn)" }}>
++                        사용자 삭제 (변경 없음) · {sel.review.dismissed_by ?? "?"} {sel.review.dismissed_at && new Date(sel.review.dismissed_at).toLocaleString()} – 목록에서 오른쪽 클릭하면 복원할 수 있습니다
++                      </div>
++                    )}
++                    {hist && hist.length > 0 && (
++                      <div className="p-1.5" style={{ border: "1px solid var(--border)" }}>
++                        <div className="sec mb-0.5">이력</div>
++                        {hist.map((h, i) => (
++                          <div key={i} style={{ color: h.action === "user_delete" ? "var(--warn)" : "var(--body)" }}>
++                            {new Date(h.changed_at).toLocaleString()} · {h.reviewer ?? "?"} · {h.label}{h.action === "user_delete" ? "" : ` → ${REVIEW_KO[h.status].ko}`}
++                          </div>
++                        ))}
++                      </div>
++                    )}
+                 </div>
+               )}
+             </>
+--- v0.4/frontend/lib/api.ts
++++ v0.4.1/frontend/lib/api.ts
+@@ -1,7 +1,7 @@
+ // FastAPI 호출 래퍼. 오류를 숨기지 않고 ApiError 로 올린다 (빈 결과로 대체하지 않음).
+ import type {
+   AiRun, AiStatus, AppSettings, Bubble, BBox, Change, Colors, Comparison, DocumentInfo, ExportInfo, ExportKind,
+-  ImageLayer, JobStatus, Markup, Project, ReviewStatus,
++  HistoryItem, ImageLayer, JobStatus, Markup, Project, ReviewStatus,
+ } from "./types";
+ 
+ /** 창 1개 실행(빌드)에서는 같은 서버 → 빈 값. 개발 모드에서만 .env.local 로 지정 */
+@@ -103,6 +103,12 @@
+   listChanges: (id: string) => request<Change[]>(`/api/comparisons/${e(id)}/changes`),
+   patchChange: (changeId: string, body: { status?: ReviewStatus; comment?: string; reviewer?: string }) =>
+     request<Change>(`/api/changes/${e(changeId)}`, json("PATCH", body)),
++  /** 오른쪽 클릭 → 삭제 (판정 '변경 없음' + 삭제 표시, 이력: 사용자 삭제) */
++  dismissChange: (changeId: string, reviewer: string | null) =>
++    request<Change>(`/api/changes/${e(changeId)}/dismiss`, json("POST", { reviewer })),
++  restoreChange: (changeId: string, reviewer: string | null) =>
++    request<Change>(`/api/changes/${e(changeId)}/restore`, json("POST", { reviewer })),
++  changeHistory: (changeId: string) => request<HistoryItem[]>(`/api/changes/${e(changeId)}/history`),
+ 
+   bubbles: (id: string, page: number, zoom: number) =>
+     request<Bubble[]>(`/api/comparisons/${e(id)}/pages/${page}/bubbles?zoom=${zoom.toFixed(5)}`),
+--- v0.4/frontend/lib/types.ts
++++ v0.4.1/frontend/lib/types.ts
+@@ -129,11 +129,22 @@
+     detection_method: string;
+     alignment_status: AlignmentStatus;
+   };
+-  review: { status: ReviewStatus; comment: string | null; reviewer: string | null; reviewed_at: string | null };
++  review: {
++    status: ReviewStatus;
++    comment: string | null;
++    reviewer: string | null;
++    reviewed_at: string | null;
++    /** 오른쪽 클릭으로 삭제함 (판정 = No Change). 자동 탐지 결과는 그대로 보존 */
++    dismissed: boolean;
++    dismissed_at: string | null;
++    dismissed_by: string | null;
++  };
+   ai: AiInfo | null;
+   created_at: string;
+ }
+ 
++export interface HistoryItem { action: string; status: ReviewStatus; comment: string | null; reviewer: string | null; changed_at: string; label: string }
++
+ export interface Bubble { region_no: number; cx: number; cy: number; clear: boolean }
+ 
+ export interface Markup {

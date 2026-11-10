@@ -1,0 +1,32 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.16, pytest-9.1.1, pluggy-1.7.0 -- /mnt/runtime-envs/oai56-py312/python/venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/claude/dac/backend
+plugins: anyio-4.15.1, Faker-38.2.0, timeout-2.5.0, typeguard-4.6.0
+collecting ... collected 6 items
+
+tests/test_regression_vs_legacy.py::test_same_as_legacy[R1_PID_r04_vs_r06__288_0.5] PASSED [ 16%]
+tests/test_regression_vs_legacy.py::test_same_as_legacy[R2_BASIN_r2_vs_r3__200_0.25] PASSED [ 33%]
+tests/test_regression_vs_legacy.py::test_same_as_legacy[A1_PID_r06_same__200_0.25] PASSED [ 50%]
+tests/test_regression_vs_legacy.py::test_same_as_legacy[D_PID_vector_vs_raster150__200_0.25] PASSED [ 66%]
+tests/test_regression_vs_legacy.py::test_same_as_legacy[E3_PID_pagerot90__200_0.25] PASSED [ 83%]
+tests/test_regression_vs_legacy.py::test_same_as_legacy[F_PID_vs_BASIN__200_0.25] PASSED [100%]
+
+============================== slowest durations ===============================
+15.88s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[F_PID_vs_BASIN__200_0.25]
+14.23s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[R2_BASIN_r2_vs_r3__200_0.25]
+8.75s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[R1_PID_r04_vs_r06__288_0.5]
+7.39s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[E3_PID_pagerot90__200_0.25]
+5.63s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[D_PID_vector_vs_raster150__200_0.25]
+5.02s call     tests/test_regression_vs_legacy.py::test_same_as_legacy[A1_PID_r06_same__200_0.25]
+0.34s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[R1_PID_r04_vs_r06__288_0.5]
+0.30s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[E3_PID_pagerot90__200_0.25]
+0.25s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[F_PID_vs_BASIN__200_0.25]
+0.24s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[R2_BASIN_r2_vs_r3__200_0.25]
+0.23s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[A1_PID_r06_same__200_0.25]
+0.23s setup    tests/test_regression_vs_legacy.py::test_same_as_legacy[D_PID_vector_vs_raster150__200_0.25]
+0.01s teardown tests/test_regression_vs_legacy.py::test_same_as_legacy[E3_PID_pagerot90__200_0.25]
+
+(5 durations < 0.005s hidden.  Use -vv to show these durations.)
+============================== 6 passed in 58.59s ==============================
+EXIT 0

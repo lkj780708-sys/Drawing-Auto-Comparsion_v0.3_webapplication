@@ -1,0 +1,6 @@
+{
+  "compilerOptions": { "target": "ES2022", "lib": ["dom", "dom.iterable", "esnext"], "module": "commonjs", "jsx": "react-jsx",
+    "outDir": "buildall", "rootDir": "/home/claude/dac/frontend", "skipLibCheck": true, "noCheck": true, "esModuleInterop": true, "types": [] },
+  "files": ["shims/react.d.ts", "shims/next.d.ts"],
+  "include": ["/home/claude/dac/frontend/components/**/*.tsx", "/home/claude/dac/frontend/lib/**/*.ts", "/home/claude/dac/frontend/app/**/*.tsx"]
+}

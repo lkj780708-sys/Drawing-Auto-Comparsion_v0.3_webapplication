@@ -1,0 +1,9 @@
+{
+ "engine_name": "Drawing Auto Comparison",
+ "engine_version": "v10 (GitHub 업데이트판, AI 검증 포함)",
+ "source_file": "compare_drawings_overlay_gui5_markup_v10.py",
+ "source_sha256": "ab805e1dbd2334440bd81faf08caf53306ef6c3bda4359f784af8b357bd8363c",
+ "previous_source_sha256": "3370d3a7fdff39c336955221e4b2c97a748f12ebfa754d8fa27ea1b07fe2860d",
+ "extracted_lines": "1-2040 (1~4부 + 4-b부, 줄 단위 그대로)",
+ "logic_changes": "없음"
+}

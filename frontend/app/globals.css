@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/* 다크 = 기존 프로그램(5부) 색상 그대로 / 라이트 = 같은 배치의 밝은 색 (신규) */
+:root, [data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121417; --panel: #16181C; --card: #1E2126; --border: #2B2F36;
+  --fg: #E6E8EB; --fg2: #8A919B; --viewbg: #2A2D33; --loaded: #1A2638;
+  --title: #F5F6F8; --section: #8A919B; --body: #B4BAC2; --hint: #7D8590; --toolbar: #B4BAC2;
+  --warn: #F0A04B; --edge-loaded: #8B949E; --shadow: #30343B;
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #F3F4F6; --panel: #FFFFFF; --card: #F1F3F5; --border: #D0D5DC;
+  --fg: #1F2328; --fg2: #57606A; --viewbg: #C9CED6; --loaded: #E3ECFB;
+  --title: #111418; --section: #57606A; --body: #3D444D; --hint: #6E7781; --toolbar: #3D444D;
+  --warn: #B45309; --edge-loaded: #57606A; --shadow: #D0D5DC;
+}
+:root {
+  --blue: #2B6CE8; --orange: #B45309; --green: #15803D; --purple: #7044D6; --red: #E5484D;
+  --bubble: #FFD33D; --bubble-edge: #8A5A00; --hilite: #FF2D55; --card-region: #FFB000; --old-frame: #5B626C;
+}
+html, body { height: 100%; overflow: hidden; }
+body { background: var(--bg); color: var(--fg); font-family: "Pretendard", "Malgun Gothic", "Segoe UI", system-ui, sans-serif; font-size: 13px; }
+.sec { color: var(--section); font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+.tbtn { background: var(--card); color: var(--fg); border: 1px solid var(--border); padding: 3px 8px; border-radius: 2px; white-space: nowrap; }
+.tbtn:hover:not(:disabled) { border-color: var(--fg2); }
+.tbtn:disabled { opacity: .45; cursor: not-allowed; }
+.tbtn.on { background: var(--blue); color: #fff; border-color: var(--blue); }
+.bigbtn { width: 100%; color: #fff; font-weight: 700; padding: 8px; border-radius: 2px; }
+.bigbtn:disabled { opacity: .5; cursor: not-allowed; }
+.box { border: 1px solid var(--border); padding: 6px 8px 8px; position: relative; margin-top: 8px; }
+.box > .legend { position: absolute; top: -8px; left: 6px; background: var(--panel); padding: 0 4px; }
+.inp { background: var(--card); color: var(--fg); border: 1px solid var(--border); padding: 2px 4px; border-radius: 2px; }
+.inp:focus { outline: 1px solid var(--blue); }
+::-webkit-scrollbar { width: 10px; height: 10px; } ::-webkit-scrollbar-track { background: var(--panel); }
+::-webkit-scrollbar-thumb { background: var(--border); }

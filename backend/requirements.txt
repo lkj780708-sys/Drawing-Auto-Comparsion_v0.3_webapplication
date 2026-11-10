@@ -1,0 +1,13 @@
+# 엔진 (기존 프로그램과 같은 라이브러리)
+pymupdf==1.26.7
+numpy
+pillow
+opencv-python
+# API 서버
+fastapi==0.136.3
+pydantic==2.13.4
+uvicorn==0.54.0
+python-multipart
+# 테스트
+pytest
+httpx
